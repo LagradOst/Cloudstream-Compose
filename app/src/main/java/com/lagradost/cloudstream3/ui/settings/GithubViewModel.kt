@@ -110,6 +110,7 @@ class GithubViewModel(
 
             is GithubAction.SkipThisUpdate -> {
                 settings.updates.skipUpdate.set(action.file.nodeId)
+                deleteCachedApk(action.file.tagName)
             }
 
             GithubAction.AutoSearchForUpdate -> {
@@ -122,6 +123,7 @@ class GithubViewModel(
 
             is GithubAction.SkipUpdate -> {
                 settings.updates.skipUpdate.set(action.file.nodeId)
+                deleteCachedApk(action.file.tagName)
             }
 
             is GithubAction.Update -> {
@@ -287,4 +289,14 @@ class GithubViewModel(
             userName = remoteUserName,
             repository = remoteRepository,
         )
+
+    private fun deleteCachedApk(tagName: String) {
+        val activity = com.lagradost.cloudstream3.CommonActivity.activity
+        if (activity != null) {
+            val file = ApkUpdater.getCachedUpdateFile(activity, tagName)
+            if (file.exists()) {
+                file.delete()
+            }
+        }
+    }
 }
