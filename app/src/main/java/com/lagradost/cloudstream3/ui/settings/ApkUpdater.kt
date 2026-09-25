@@ -20,6 +20,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.ResponseBody
+import okio.BufferedSink
+import okio.buffer
+import okio.sink
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -27,6 +30,37 @@ import java.io.OutputStream
 object ApkUpdater : AppUpdater {
     private const val APP_UPDATE_NAME = "CloudStream"
     private const val APP_UPDATE_SUFFIX = "apk"
+
+    fun getCachedUpdateFile(activity: Context, versionTag: String): File {
+        return File(activity.cacheDir, "${APP_UPDATE_NAME}_$versionTag.$APP_UPDATE_SUFFIX")
+    }
+
+    suspend fun downloadSilently(
+        context: Context,
+        url: String,
+        versionTag: String
+    ): File? = withContext(Dispatchers.IO) {
+        try {
+            val targetFile = getCachedUpdateFile(context, versionTag)
+            if (targetFile.exists() && targetFile.length() > 0) {
+                return@withContext targetFile
+            }
+
+            clearOldFiles(context)
+            val tempFile = File.createTempFile("CloudStream_tmp", ".$APP_UPDATE_SUFFIX", context.cacheDir)
+            val sink: BufferedSink = tempFile.sink().buffer()
+            sink.writeAll(app.get(url).body.source())
+            sink.close()
+
+            if (tempFile.renameTo(targetFile)) {
+                targetFile
+            } else {
+                tempFile
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
     @Throws
     override suspend fun update(
@@ -55,9 +89,63 @@ object ApkUpdater : AppUpdater {
         }
     }
 
-    fun clearOldFiles(activity: Activity) {
+    @Throws
+    suspend fun installFromFile(
+        activity: Activity,
+        file: File,
+        settings: AppSettings,
+        installProgress: (Long, Long?) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        when (settings.updates.apkInstaller.get()) {
+            0 -> {
+                val length = file.length()
+                file.inputStream().use { inputStream ->
+                    var sessionId: Int? = null
+                    val packageInstaller = activity.packageManager.packageInstaller
+                    try {
+                        val installParams =
+                            PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            installParams.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+                        }
+                        installParams.setSize(length)
+
+                        sessionId = packageInstaller.createSession(installParams)
+                        val session = packageInstaller.openSession(sessionId)
+
+                        session.openWrite(activity.packageName, 0, length)
+                            .use { writeStream ->
+                                transfer(writeStream, inputStream, length, installProgress)
+                                session.fsync(writeStream)
+                            }
+
+                        val receiverIntent = Intent(activity, PackageInstallerStatusReceiver::class.java)
+                        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        } else {
+                            PendingIntent.FLAG_UPDATE_CURRENT
+                        }
+                        val receiverPendingIntent = PendingIntent.getBroadcast(activity, 0, receiverIntent, flags)
+                        session.commit(receiverPendingIntent.intentSender)
+                        session.close()
+                    } catch (t: Throwable) {
+                        sessionId?.let { id ->
+                            packageInstaller.abandonSession(id)
+                        }
+                        throw t
+                    }
+                }
+            }
+            else -> {
+                openApk(activity, file)
+            }
+        }
+    }
+
+    fun clearOldFiles(context: Context) {
         // Delete old files
-        activity.cacheDir.listFiles()?.filter {
+        context.cacheDir.listFiles()?.filter {
             it.name.startsWith(APP_UPDATE_NAME) && it.extension == APP_UPDATE_SUFFIX
         }?.forEach {
             deleteFileOnExit(it)
